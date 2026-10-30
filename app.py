@@ -35,7 +35,7 @@ if user_input:
     # 모델 응답 생성
     try:
         response = client.responses.create(
-            model="gpt-4.1-mini",
+            model="gpt-4.0-mini",
             input=st.session_state.messages
         )
         assistant_reply = response.output_text
