@@ -165,9 +165,14 @@ def text_to_speech(answer):
 def add_task(title, due="", details=""):
     if due:
         due = parse_time(due).isoformat()
+
     if not any(t["title"] == title and t["due"] == due and not t["done"] for t in data["tasks"]):
         data["tasks"].append({"id": new_id(), "title": title, "due": due, "details": details, "done": False})
         save_data()
+
+    if due:
+        st.session_state.next_calendar_date = parse_time(due).date().isoformat()
+
     return {"status": "saved", "title": title}
 
 
@@ -347,6 +352,7 @@ def add_event(title, start, end, category, event_id=""):
     data["events"].append(event)
     st.session_state.conflict = None
     save_data()
+    st.session_state.next_calendar_date = start.date().isoformat()
     return {"status": "saved", **event}
 
 
@@ -539,11 +545,19 @@ elif page == "대시보드":
     cols[0].metric("오늘 일정", f"{len(todays)}개")
     cols[1].metric("남은 할 일", f"{len(tasks)}개")
     cols[2].metric("기한 지난 업무", f"{sum(1 for t in tasks if t['due'] and parse_time(t['due']) < now())}개")
+    with st.expander("저장된 기록 확인"):
+        st.write(f"전체 일정: {len(data['events'])}개 · 전체 할 일: {len(data['tasks'])}개")
     left, right = st.columns([2, 1])
     with left:
         st.subheader("캘린더")
-        selected = st.date_input("확인할 날짜", today)
-        st.caption("🟣 회의 · 🟢 업무 · 🟠 개인")
+        if "next_calendar_date" in st.session_state:
+            st.session_state.calendar_date = datetime.fromisoformat(
+                st.session_state.pop("next_calendar_date")
+            ).date()
+        if "calendar_date" not in st.session_state:
+            st.session_state.calendar_date = today
+        selected = st.date_input("확인할 날짜", key="calendar_date")
+        st.caption("🟣 회의 · 🟢 업무 일정 · 🟠 개인 · 🟡 할 일 마감")
         table = '<table class="cal"><tr>' + ''.join(f'<th>{day}</th>' for day in "월화수목금토일") + '</tr>'
         for week in calendar.monthcalendar(selected.year, selected.month):
             table += '<tr>'
@@ -555,6 +569,14 @@ elif page == "대시보드":
                     for event in events:
                         label = parse_time(event["start"]).strftime("%H:%M ") + event["title"]
                         table += f'<div class="item" style="background:{COLORS[event["category"]]}">{html.escape(label)}</div>'
+                    day_tasks = [
+                        t for t in data["tasks"]
+                        if t.get("due") and not t.get("done", False)
+                        and parse_time(t["due"]).date() == date
+                    ]
+                    for task in day_tasks:
+                        label = "할 일 · " + task["title"]
+                        table += f'<div class="item" style="background:#b7791f">{html.escape(label)}</div>'
                 table += '</td>'
             table += '</tr>'
         st.markdown(table+'</table>', unsafe_allow_html=True)
@@ -562,8 +584,16 @@ elif page == "대시보드":
         events = [e for e in data["events"] if parse_time(e["start"]).date() <= selected <= (parse_time(e["end"])-timedelta(microseconds=1)).date()]
         for event in sorted(events, key=lambda e: e["start"]):
             st.write(f"**{parse_time(event['start']).strftime('%H:%M')} · {event['title']}** ({event['category']})")
-        if not events:
-            st.caption("등록된 일정이 없어요. 왼쪽 로고로 일정을 말씀해주세요.")
+        day_tasks = [
+            t for t in data["tasks"]
+            if t.get("due") and not t.get("done", False)
+            and parse_time(t["due"]).date() == selected
+        ]
+        for task in day_tasks:
+            st.write(f"🟡 할 일 마감 · **{task['title']}**")
+        if not events and not day_tasks:
+            st.caption("이 날짜에 등록된 일정이나 할 일 마감이 없어요.")
+        st.caption("기한이 없는 할 일은 오른쪽 목록에 표시됩니다.")
     with right:
         st.subheader("해야 할 일")
         for task in sorted(data["tasks"], key=lambda t: (t["done"], t["due"] or "9999")):
