@@ -511,6 +511,33 @@ def fmt_date(d):
     return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
 
 
+def date_table():
+    # '이번 주 목요일' 같은 표현을 LLM이 직접 계산하지 않고 표에서 찾아 쓰도록, 오늘 기준 날짜표를 매번 새로 만듦
+    # (today가 실행할 때마다 바뀌므로 내년·연말에도 그 주에 맞는 날짜가 자동으로 들어감)
+    monday = today - dt.timedelta(days=today.weekday())
+    near = [f"{label} {(today + dt.timedelta(days=i)).isoformat()}({WEEKDAYS[(today + dt.timedelta(days=i)).weekday()]})"
+            for i, label in enumerate(["오늘", "내일", "모레", "글피"])]
+    lines = ["[날짜표] 한 주는 월요일~일요일입니다. 날짜는 직접 계산하지 말고 반드시 이 표에서 골라 씁니다.",
+             "- " + ", ".join(near)]
+    for w, label in enumerate(["지난 주", "이번 주", "다음 주", "다다음 주"], start=-1):
+        days = [monday + dt.timedelta(days=7 * w + i) for i in range(7)]
+        lines.append(f"- {label}: " + ", ".join(f"{WEEKDAYS[d.weekday()]} {d.isoformat()}" for d in days))
+    lines += ["- '이번 주/다음 주' 없이 요일만 말하면(예: '목요일에') 오늘 이후(오늘 포함) 가장 가까운 그 요일입니다.",
+              "- 시간에 오전/오후가 없을 때: 1~7시는 오후(13:00~19:00), 8~11시는 오전, 12시는 12:00으로 봅니다.",
+              "  '오전', '새벽', '아침'이라고 말했을 때만 1~7시를 오전으로 씁니다."]
+    return "\n".join(lines)
+
+
+def check_weekday(date_iso, weekday):
+    # 김 대리가 말한 요일과 도구에 넘어온 날짜의 요일이 다르면 등록하지 않고 다시 계산하게 함
+    d = parse_date(date_iso)
+    if not weekday or d is None or WEEKDAYS[d.weekday()] == weekday:
+        return None
+    return {"status": "failed", "retry": True,
+            "error": f"{date_iso}는 {WEEKDAYS[d.weekday()]}요일인데 요청한 요일은 {weekday}요일입니다. "
+                     "등록하지 않았습니다. [날짜표]에서 날짜를 다시 찾아 도구를 다시 호출하세요."}
+
+
 # 예전 버전에서 저장한 일정·할 일·연락처·대화도 새 형식으로 읽기 (시간 없는 일정은 종일 일정으로 그대로 유지)
 for _e in data["events"]:
     _e.setdefault("note", "")
@@ -704,7 +731,7 @@ TASK_RULES = [
     "- evidence에는 그 업무가 김 대리에게 맡겨졌다는 근거 문장을 원문에서 글자 그대로 한 문장 복사합니다.",
     "- due_type: 날짜나 요일이 구체적이면 exact(예: 11월 14일까지, 이번 주 금요일까지),",
     "  '다음 주까지', '다음 달 초', '빨리', '출시 2주 전'처럼 대략적이면 approximate, 기한 언급이 없으면 none.",
-    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 오늘 기준 YYYY-MM-DD로 바꿔 씁니다.",
+    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 [날짜표]에서 찾아 YYYY-MM-DD로 씁니다.",
     "- priority: 원문에 '중요', '꼭', '빨리', '급하게' 같은 표현이 있으면 높음, 없으면 보통.",
 ]
 
@@ -1620,14 +1647,17 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string", "description": "일정 제목"},
                 "date": {"type": "string", "description": "날짜 YYYY-MM-DD"},
-                "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
+                "start": {"type": "string",
+                          "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열. 오전/오후 없는 1~7시는 오후(예: 2시 → 14:00)"},
                 "end": {"type": "string",
                         "description": "끝나는 시간 HH:MM. 말하지 않았으면 빈 문자열 → 종류별 자동 "
                                        f"({type_guide()})"},
                 "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
+                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
+                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["title", "date", "start", "end", "category", "note"], "additionalProperties": False,
+            "required": ["title", "date", "start", "end", "category", "note", "weekday"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1642,8 +1672,10 @@ TOOLS = [
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "start": {"type": "string", "description": "HH:MM, 종일이면 빈 문자열"},
                 "end": {"type": "string", "description": "HH:MM, 모르면 빈 문자열(원래 길이 유지)"},
+                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
+                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["id", "date", "start", "end"], "additionalProperties": False,
+            "required": ["id", "date", "start", "end", "weekday"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1718,6 +1750,10 @@ def recent_mails_for_chat(count=5):
 def run_tool(name, args):
     if name == "add_todo":
         return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블", args["category"])
+    if name in ("add_event", "move_event"):
+        bad = check_weekday(args["date"], args.get("weekday", ""))
+        if bad:
+            return bad
     if name == "add_event":
         return add_event(args["title"], args["date"], args["note"], "에이블", args["start"], args["end"],
                          args["category"])
@@ -1770,12 +1806,14 @@ def system_prompt():
     lines = [
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 요청한 업무를 최선을 다해 처리합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일), 현재 시각: {now_kst()[11:]}",
+        date_table(),
         f"김 대리 이메일: {my_email() or '(미설정)'}",
         "",
         "규칙",
         "- [현재 업무 데이터], [최근 회의], 첨부 파일, 이전 대화에 있는 내용만 근거로 답합니다.",
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
-        "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
+        "- '이번 주 목요일', '모레 오후 3시' 같은 표현은 [날짜표]에서 날짜를 찾아 YYYY-MM-DD, HH:MM으로 도구에 넘깁니다.",
+        "  요일을 말했으면 add_event·move_event의 weekday에 그 요일을 넣습니다. 요일이 맞지 않는다는 결과가 오면 날짜표를 다시 보고 고칩니다.",
         "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다. 제목에 이모티콘을 넣지 않습니다.",
         f"- 일정 종류: {' / '.join(EVENT_CATS)} 중 내용에 맞게 고릅니다. (김 대리가 직접 정한 종류 목록)",
         f"- 할 일 분류: {' / '.join(TODO_CATS)} 중 내용에 맞게 고릅니다.",
@@ -1969,7 +2007,8 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-            actions.append(act)
+            if not (isinstance(result, dict) and result.get("retry")):
+                actions.append(act)
             inputs.append({"type": "function_call_output", "call_id": c.call_id,
                            "output": json.dumps(result, ensure_ascii=False)})
     return resp.output_text or "요청을 처리했습니다.", actions, mail
@@ -2157,6 +2196,7 @@ def analyze_meeting(text, title="", attendees=""):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 회의 원문을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 회의는 오늘 열렸다고 가정합니다.",
+        date_table(),
         "원문이 음성 인식 결과일 수 있어 오탈자가 있을 수 있습니다. 문맥상 분명한 것만 바로잡습니다.",
         "",
         "[작성 규칙]",
@@ -2443,6 +2483,7 @@ def analyze_mails(mails):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 받은 메일을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 여기서 '원문'은 각 메일의 제목과 본문입니다.",
+        date_table(),
         "메일마다 index(입력 번호 그대로), category, summary(1~2문장), kim_tasks, events, needs_reply, reply_draft를 씁니다.",
         *TASK_RULES,
         "- 메일을 받은 김 대리에게 요청된 일이 kim_tasks입니다. 광고·자동 알림·단순 공유면 빈 배열.",
