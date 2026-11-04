@@ -360,7 +360,16 @@ def make_tool(name, description, properties):
             "parameters": {"type": "object", "properties": {k: {"type": "string", "description": v} for k, v in properties.items()}, "required": list(properties), "additionalProperties": False}, "strict": True}
 
 
+def open_page(page):
+    pages = ["에이블과 대화", "대시보드", "회의 분석", "메일 비서", "메모"]
+    if page not in pages:
+        raise ValueError("화면 이름을 확인해주세요.")
+    st.session_state.next_page = page
+    return {"status": "opened", "page": page}
+
+
 tools = [
+    make_tool("open_page", "요청한 화면을 엽니다.", {"page": "에이블과 대화/대시보드/회의 분석/메일 비서/메모"}),
     make_tool("get_records", "일정·할 일·메모·연락처·회의를 조회합니다.", {"kind": "events/tasks/notes/contacts/meetings 중 하나"}),
     make_tool("add_task", "할 일을 저장합니다.", {"title": "할 일", "due": "한국시간 ISO8601. 기한 미정은 빈 문자열", "details": "상세"}),
     make_tool("complete_task", "조회한 할 일을 완료 처리합니다.", {"task_id": "실제 업무 ID"}),
@@ -375,6 +384,8 @@ tools = [
 
 
 def run_tool(name, args):
+    if name == "open_page":
+        return open_page(**args)
     if name == "get_records":
         kind = args["kind"]
         if kind not in ("events", "tasks", "notes", "contacts", "meetings"):
@@ -421,6 +432,7 @@ def ask_able(prompt):
         return confirmation
     sys_role = f"""당신은 {USER_NAME}의 개인 비서 '에이블'입니다. 한국어로 친절하고 간결하게 답하세요.
 현재 한국 날짜·시간은 {now().isoformat()}입니다.
+화면을 열어달라는 요청은 open_page 도구로 실행하세요. 화면을 설명할 때는 get_records로 실제 데이터를 조회해서 설명하세요. 대시보드는 events와 tasks를 조회하세요.
 요청받은 일정·할 일·메모는 설명만 하지 말고 도구로 저장하세요. 저장 성공한 일만 완료했다고 말하세요.
 저장된 항목을 먼저 조회하고 실제 ID로 수정하세요. 일정 종료 시간 미지정은 1시간으로 잡고 알려주세요.
 시간이 모호하면 필요한 것만 질문하세요. 일정 충돌 시 대체 3개를 제안하고 선택하면 직접 등록하세요.
@@ -445,6 +457,9 @@ def ask_able(prompt):
         for call in tool_calls:
             try:
                 result = run_tool(call.name, json.loads(call.arguments))
+                destinations = {"add_task": "대시보드", "complete_task": "대시보드", "add_event": "대시보드", "save_note": "메모", "save_contact": "메일 비서", "prepare_email": "메일 비서", "summarize_meeting": "회의 분석"}
+                if call.name in destinations and result.get("status") not in ("failed", "need_recipient"):
+                    open_page(destinations[call.name])
             except ValueError as error:
                 result = {"status": "failed", "message": str(error)}
             except Exception:
@@ -476,13 +491,20 @@ def open_chat():
     st.session_state.page = "에이블과 대화"
 
 
+if "next_page" in st.session_state:
+    st.session_state.page = st.session_state.pop("next_page")
+
 with st.sidebar:
-    if (ROOT / "assets" / "aivle-reference.png").exists():
-        st.image(str(ROOT / "assets" / "aivle-reference.png"))
-    st.title("✦ 에이블")
-    st.caption("말씀만 하세요. 제가 챙길게요.")
+    from voice_panel import able_profile
+    voice_event = able_profile(
+        chat_id=st.session_state.chat_id,
+        audio=st.session_state.get("audio_reply"),
+        reply_id=st.session_state.get("reply_id", ""),
+        enabled=st.session_state.get("voice_enabled", True),
+        notice=st.session_state.get("voice_error", ""),
+    )
     page = st.radio("메뉴", ["에이블과 대화", "대시보드", "회의 분석", "메일 비서", "메모"], key="page")
-    st.caption("모든 업무 지시는 ‘에이블과 대화’의 마이크 하나로 받습니다.")
+    st.caption("어느 화면에서든 위 로고를 눌러 지시하세요.")
     if page != "에이블과 대화":
         st.button("에이블에게 지시하기", on_click=open_chat, width="stretch")
     st.button("＋ 새 대화", on_click=new_chat, width="stretch")
@@ -494,20 +516,19 @@ with st.sidebar:
             st.session_state.audio_reply = None
             st.rerun()
     st.divider()
-    voice_reply = st.toggle("답변을 음성으로 듣기", value=True)
+    voice_reply = st.toggle("답변을 음성으로 듣기", value=True, key="voice_enabled")
     st.caption(f"{USER_NAME}님 · 개인 실습용")
     st.caption("음성은 AI가 생성한 목소리입니다.")
     st.download_button("내 기록 백업", json.dumps(data, ensure_ascii=False, indent=2), file_name="에이블_기록.json")
 
 if page == "에이블과 대화":
-    st.title(f"{USER_NAME}님, 무엇을 도와드릴까요?")
-    st.write("일정 잡기부터 메일 보내기까지, 말로 맡겨주세요.")
-    columns = st.columns(3)
-    for col, example in zip(columns, ["오늘 일정과 할 일을 정리해줘", "안 읽은 메일 요약해줘", "내일 오전 10시에 팀 회의 잡아줘"]):
-        col.button(example, on_click=queue, args=(example,), width="stretch")
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
+    if not st.session_state.messages:
+        st.markdown('<div style="min-height:55vh;display:grid;place-items:center"><h1>무엇을 도와드릴까요?</h1></div>', unsafe_allow_html=True)
+    else:
+        st.title("에이블과 대화")
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
 
 elif page == "대시보드":
     st.title("나의 하루, 에이블과 함께")
@@ -542,7 +563,7 @@ elif page == "대시보드":
         for event in sorted(events, key=lambda e: e["start"]):
             st.write(f"**{parse_time(event['start']).strftime('%H:%M')} · {event['title']}** ({event['category']})")
         if not events:
-            st.caption("등록된 일정이 없어요. 아래 마이크로 일정을 말씀해주세요.")
+            st.caption("등록된 일정이 없어요. 왼쪽 로고로 일정을 말씀해주세요.")
     with right:
         st.subheader("해야 할 일")
         for task in sorted(data["tasks"], key=lambda t: (t["done"], t["due"] or "9999")):
@@ -633,15 +654,6 @@ if conflict and page in ("에이블과 대화", "대시보드"):
         st.write(f"대체 {i}: {parse_time(slot['start']).strftime('%m/%d %H:%M')}–{parse_time(slot['end']).strftime('%H:%M')}")
     st.caption("예: ‘두 번째 시간으로 잡아줘’. 대체 시간이 없으면 다른 날짜를 말씀해주세요.")
 
-if page == "에이블과 대화" and st.session_state.get("audio_reply"):
-    if setting("USE_VOICE_VISUAL", False) in (True, "true", "1"):
-        # 선택 심화: 기능 수업과 분리한 로고·음량 시각화 파일입니다.
-        from voice_panel import voice_panel
-        voice_panel(st.session_state.audio_reply, autoplay=st.session_state.pop("autoplay", False))
-    else:
-        st.audio(st.session_state.audio_reply, format="audio/mp3", autoplay=st.session_state.pop("autoplay", False))
-
-
 
 # ============================================================
 # 6. 한 번의 요청 처리 — 기존 미션 6 + 도구 호출 연결
@@ -650,6 +662,7 @@ def process_request(prompt, meeting_recording=False):
     # 회의 원문은 회의 목록에 보관하고 채팅에는 짧게 표시합니다.
     add_message("user", "회의 녹음을 마쳤어요. 회의 내용과 제 업무를 정리해주세요." if meeting_recording else prompt)
     st.session_state.audio_reply = None
+    st.session_state.voice_error = ""
     with st.spinner("에이블이 처리하고 있어요…"):
         try:
             if chat.get("meeting_recording") and prompt.strip().replace(" ", "").rstrip(".!?") in ("취소", "녹음취소", "회의녹음취소"):
@@ -674,31 +687,40 @@ def process_request(prompt, meeting_recording=False):
             try:
                 st.session_state.audio_reply = text_to_speech(answer)
                 st.session_state.autoplay = True
-            except Exception:
-                # 음성 출력 실패가 업무 처리 실패가 되지 않도록 구분합니다.
-                st.session_state.voice_error = "답변은 준비했지만 음성 출력에 실패했어요. 텍스트로 확인해주세요."
+            except Exception as error:
+                st.session_state.voice_error = f"음성 생성 실패: {type(error).__name__} (상태: {getattr(error, 'status_code', '확인 필요')})"
+        st.session_state.reply_id = new_id()
     st.rerun()
 
+
+import base64
+import io
+
+if voice_event.recording:
+    recording = voice_event.recording
+    if recording["id"] != st.session_state.get("last_recording") and recording["chat_id"] == st.session_state.chat_id:
+        st.session_state.last_recording = recording["id"]
+        try:
+            audio_file = io.BytesIO(base64.b64decode(recording["audio"], validate=True))
+            audio_file.name = "recording.m4a" if "mp4" in recording["mime"] else "recording.webm"
+            prompt = speech_to_text(audio_file)
+            if not prompt.strip():
+                raise ValueError("말씀을 인식하지 못했어요. 다시 녹음해주세요.")
+            process_request(prompt, meeting_recording=bool(chat.get("meeting_recording")))
+        except Exception as error:
+            st.session_state.voice_error = f"음성 처리 실패: {type(error).__name__}. API 설정과 녹음을 확인해주세요."
+            st.session_state.audio_reply = None
+            st.session_state.reply_id = new_id()
+            st.rerun()
 
 if page == "에이블과 대화":
     if st.session_state.get("voice_error"):
         st.caption(st.session_state.pop("voice_error"))
     st.divider()
     if chat.get("meeting_recording"):
-        st.info("회의 녹음 대기 중이에요. 아래 마이크로 회의를 녹음하고 종료하면 자동 분석합니다. 취소하려면 ‘회의 녹음 취소’라고 말하거나 입력해주세요.")
+        st.info("회의 녹음 대기 중이에요. 왼쪽 로고로 회의를 녹음하고 종료하면 자동 분석합니다. 취소하려면 ‘회의 녹음 취소’라고 말하거나 입력해주세요.")
     else:
-        st.caption("마이크 하나로 일정·메일·메모·회의 업무를 모두 맡겨주세요. 회의 녹음은 먼저 ‘회의 녹음 시작해줘’라고 말씀하세요.")
-    audio_value = st.audio_input("에이블에게 말하기 · 녹음 종료 후 자동 처리", key="voice_"+st.session_state.chat_id)
-    if audio_value:
-        digest = hashlib.sha256(audio_value.getvalue()).hexdigest()
-        if digest != st.session_state.get("voice_done_"+st.session_state.chat_id):
-            st.session_state["voice_done_"+st.session_state.chat_id] = digest
-            try:
-                prompt = speech_to_text(audio_value)
-                if prompt.strip():
-                    process_request(prompt, meeting_recording=bool(chat.get("meeting_recording")))
-            except Exception:
-                st.error("음성을 읽지 못했어요. API 설정을 확인한 뒤 다시 녹음해주세요.")
+        st.caption("왼쪽 로고로 일정·메일·메모·회의 업무를 모두 맡겨주세요. 회의 녹음은 먼저 ‘회의 녹음 시작해줘’라고 말씀하세요.")
     # 회의 파일도 이 대화창에만 첨부합니다. 기능별 화면에는 입력창이 없습니다.
     with st.expander("회의 자료 첨부 · 음성 또는 텍스트 파일"):
         source = st.file_uploader("첨부하면 회의 분석과 내 업무 등록을 자동으로 진행해요", type=["wav", "mp3", "m4a", "webm", "mp4", "ogg", "flac", "txt", "md"], key="meeting_file_"+st.session_state.chat_id)
