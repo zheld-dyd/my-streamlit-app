@@ -143,7 +143,8 @@ def normalize_note(n):
             t.setdefault(k, v)
     for sc in n["schedules"]:
         for k, v in {"title": "", "when_text": "", "date_type": "none", "date": "", "evidence": "",
-                     "verified": True}.items():
+                     "verified": True, "start": "", "end": "", "place": "", "kim_attends": False,
+                     "category": "기타", "status": "info", "event_id": ""}.items():
             sc.setdefault(k, v)
     return n
 
@@ -692,7 +693,7 @@ STT_CHAT_MODELS = ["gpt-4o-transcribe", "whisper-1"]   # 정확도가 높은 모
 def speech_to_text(audio_bytes, name="voice.wav", hint=None, models=("whisper-1",)):
     last_err = None
     for model in models:
-        kwargs = {"model": model, "file": (name, audio_bytes), "language": "ko"}
+        kwargs = {"model": model, "file": (name, audio_bytes), "language": "ko", "temperature": 0}
         if hint:
             kwargs["prompt"] = hint
         try:
@@ -1010,11 +1011,16 @@ def _squash(s):
 
 
 def found_in(evidence, source):
-    # AI가 제시한 근거 문장이 실제 원문에 있는지 확인 (띄어쓰기·문장부호 차이는 무시)
-    e, s = _squash(evidence), _squash(source)
+    # AI가 제시한 근거 문장이 실제 원문에 있는지 확인 (띄어쓰기·문장부호·말한 사람 표시 차이는 무시)
+    ev = re.sub(r"^\s*[^\s:：]{1,8}\s*[:：]\s*", "", evidence or "")      # '팀장: ...' → '...'
+    e, s = _squash(ev), _squash(source)
     if len(e) < 4:
         return False
-    return e in s or (len(e) >= 12 and (e[:12] in s or e[-12:] in s))
+    if e in s or (len(e) >= 12 and (e[:12] in s or e[-12:] in s)):
+        return True
+    # 원문을 조금 바꿔 옮긴 경우: 6글자씩 잘라 70% 이상이 원문에 그대로 있으면 근거로 인정 (지어낸 문장은 통과 못 함)
+    chunks = [e[i:i + 6] for i in range(0, len(e) - 5, 3)]
+    return len(chunks) >= 3 and sum(c in s for c in chunks) / len(chunks) >= 0.7
 
 
 TASK_ITEM = {
@@ -1072,6 +1078,46 @@ def apply_kim_tasks(tasks, source_text, source_label):
                      todo_id=item["id"])
         out.append(t)
     return out
+
+
+def apply_meeting_schedules(schedules, source_text):
+    # 김 대리가 참석하는, 날짜가 정확한 일정만 캘린더에 추가. 기존 일정과 겹치면 임의로 바꾸지 않고 김 대리 확인을 기다림
+    out = []
+    for sc in schedules:
+        sc = dict(sc, verified=found_in(sc["evidence"], source_text), event_id="")
+        d = parse_date(sc["date"]) if sc["date_type"] == "exact" else None
+        if not sc["verified"]:
+            sc["status"] = "unverified"
+        elif not sc["kim_attends"]:
+            sc["status"] = "info"
+        elif d is None:
+            sc["status"] = "approximate"
+        else:
+            note = " / ".join(x for x in [sc["place"] and f"장소: {sc['place']}", "회의에서 정한 일정"] if x)
+            fields = build_event(sc["title"], sc["date"], sc["start"], sc["end"], sc["category"], note)
+            same = next((e for e in data["events"] if e["date"] == fields["date"]
+                         and _squash(e["title"]) == _squash(fields["title"])), None)
+            conflicts = find_conflicts(fields["date"], fields["start"], fields["end"])
+            if same:
+                sc.update(status="duplicate", event_id=same["id"])
+            elif conflicts:
+                sc.update(status="conflict", conflicts=[conflict_text(c) for c in conflicts])
+            else:
+                item = commit_event(fields, "add", None, "회의 분석")
+                sc.update(status="calendar", event_id=item["id"] if item else "")
+        out.append(sc)
+    return out
+
+
+def schedule_status_line(sc):
+    return {
+        "calendar": "📅 캘린더에 추가했어요",
+        "duplicate": "↔️ 이미 캘린더에 있는 일정이에요",
+        "conflict": "⚠️ 기존 일정과 겹쳐서 아직 추가하지 않았어요 (기존 일정은 그대로 둠)",
+        "approximate": "🕓 날짜가 정확하지 않아 캘린더에는 넣지 않았어요",
+        "info": "ℹ️ 김 대리 참석 일정이 아니라 참고로만 보여 드려요",
+        "unverified": "⚠️ 원문에서 근거를 찾지 못해 추가하지 않았어요",
+    }.get(sc.get("status"), "ℹ️ 참고용 일정")
 
 
 def task_status_line(t):
@@ -1222,7 +1268,7 @@ def review_email(rcpt, subject, body, context=""):
         who += f" / 직함: {c['role'] or '-'} / 소속: {c['team'] or '-'} / 메모: {c['memo'] or '-'}"
     try:
         resp = get_client().responses.create(
-            model=MODEL,
+            model=MODEL, temperature=0,
             instructions="\n".join([
                 "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 한 번 점검합니다.",
                 f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
@@ -2850,7 +2896,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
     sent_mail = None                     # 이번 답변에서 이미 보낸 메일 (같은 메일을 두 번 보내지 않게)
     asked_delete = False                 # 이번 답변에서 삭제 대상을 보여 줬으면 같은 답변에서는 삭제 금지
     for _ in range(5):  # 도구 호출은 최대 5회 반복
-        resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
+        resp = client.responses.create(model=MODEL, temperature=0, instructions=instructions, input=inputs, tools=TOOLS)
         calls = [i for i in resp.output if i.type == "function_call"]
         if not calls:
             return resp.output_text, actions, mail
@@ -3051,13 +3097,19 @@ with tab_chat:
 SCHEDULE_ITEM = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "description": "일정 이름 (예: B사 제휴 미팅, 중간 점검 회의)"},
         "when_text": {"type": "string", "description": "시점 표현 원문 그대로"},
         "date_type": {"type": "string", "enum": ["exact", "approximate", "none"]},
         "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
-        "evidence": {"type": "string", "description": "원문에서 그대로 복사한 근거 문장 1개"},
+        "start": {"type": "string", "description": "원문에 시작 시각이 있으면 HH:MM(24시간), 없으면 빈 문자열"},
+        "end": {"type": "string", "description": "원문에 끝나는 시각이 있으면 HH:MM, 없으면 빈 문자열"},
+        "place": {"type": "string", "description": "원문에 나온 장소, 없으면 빈 문자열"},
+        "kim_attends": {"type": "boolean", "description": "원문에 김 대리가 참석한다고 나오면 true"},
+        "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
+        "evidence": {"type": "string", "description": "날짜·시간이 나온 원문 문장을 그대로 복사"},
     },
-    "required": ["title", "when_text", "date_type", "date", "evidence"],
+    "required": ["title", "when_text", "date_type", "date", "start", "end", "place", "kim_attends", "category",
+                 "evidence"],
     "additionalProperties": False,
 }
 
@@ -3069,7 +3121,7 @@ MEETING_SCHEMA = {
         "decisions": {"type": "array", "items": {"type": "string"}, "description": "회의에서 확정된 사항"},
         "kim_tasks": {"type": "array", "items": TASK_ITEM},
         "schedules": {"type": "array", "items": SCHEDULE_ITEM,
-                      "description": "김 대리 업무가 아닌, 회의에서 언급된 일정(출시, 광고 시작, 다음 회의 등)"},
+                      "description": "회의에서 언급된 일정(미팅, 다음 회의, 프로모션 기간 등). 업무 마감일은 kim_tasks에만"},
     },
     "required": ["title_guess", "summary", "decisions", "kim_tasks", "schedules"],
     "additionalProperties": False,
@@ -3086,10 +3138,13 @@ def analyze_meeting(text, title="", attendees=""):
         "[작성 규칙]",
         *TASK_RULES,
         "- summary: 안건별 핵심을 3~6개 문장으로. decisions: 회의에서 확정된 사항만.",
-        "- schedules: 김 대리 업무가 아닌 일정만. when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게.",
+        "- schedules: 회의에서 언급된 일정(미팅·회의·행사·기간). 업무 마감일은 schedules에 넣지 않고 kim_tasks에만 씁니다.",
+        "  when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게. start/end는 원문에 시각이 있을 때만 24시간 HH:MM",
+        "  (오후 2시 → 14:00). kim_attends는 원문에 김대리가 참석한다고 나올 때만 true.",
+        "  다른 일정과 겹친다는 말이 있어도 일정을 바꾸거나 지우지 말고 원문 그대로 적습니다.",
     ])
     resp = get_client().responses.create(
-        model=MODEL, instructions=instructions,
+        model=MODEL, temperature=0, instructions=instructions,
         input=f"[회의 제목] {title or '(입력 없음)'}\n[참석자] {attendees or '(입력 없음)'}\n\n[회의 원문]\n{text}",
         text={"format": {"type": "json_schema", "name": "meeting_analysis",
                          "schema": MEETING_SCHEMA, "strict": True}},
@@ -3171,9 +3226,9 @@ with tab_meet:
                     text = src_text
                 st.write("② 회의 내용 분석 중")
                 res = analyze_meeting(text, m_title, m_people)
-                st.write("③ 김 대리 업무를 할 일·캘린더에 반영 중")
+                st.write("③ 김 대리 업무를 할 일에, 김 대리 참석 일정을 캘린더에 반영 중")
                 tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 분석")
-                schedules = [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]]
+                schedules = apply_meeting_schedules(res["schedules"], text)
                 note = {
                     "id": uuid.uuid4().hex[:8],
                     "title": m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의",
@@ -3187,6 +3242,8 @@ with tab_meet:
                 save_data()
                 n_cal = sum(t["status"] == "calendar" for t in tasks)
                 n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
+                n_ev = sum(sc["status"] == "calendar" for sc in schedules)
+                n_conf = sum(sc["status"] == "conflict" for sc in schedules)
                 status.update(label="분석 완료!", state="complete")
                 done = True
             except Exception as e:
@@ -3194,7 +3251,9 @@ with tab_meet:
                 st.error(f"오류 내용: {e}")
         if done:
             st.session_state.meet_view = note["id"]
-            st.session_state.pending_toast = f"김 대리 업무 {n_add}건을 할 일에 추가했어요 (캘린더 {n_cal}건)."
+            st.session_state.pending_toast = (f"할 일 {n_add}건(마감일 있는 것 {n_cal}건), 일정 {n_ev}건을 추가했어요."
+                                              + (f" 기존 일정과 겹치는 {n_conf}건은 회의 분석 화면에서 확인해 주세요."
+                                                 if n_conf else ""))
             st.rerun()
 
     notes = data["meeting_notes"]
@@ -3234,14 +3293,30 @@ with tab_meet:
             st.markdown("\n".join(f"- {s}" for s in n["decisions"]) or "_(확정된 사항이 없습니다)_")
         with r:
             st.markdown("#### 🗓️ 회의에서 언급된 일정")
-            st.caption("참고용입니다. 캘린더에는 넣지 않았어요.")
+            st.caption("김 대리님이 참석하는, 날짜가 정확한 일정만 캘린더에 넣어요. 기존 일정과 겹치면 임의로 바꾸지 않아요.")
             if not n["schedules"]:
                 st.caption("언급된 일정이 없습니다.")
-            for s in n["schedules"]:
+            for j, s in enumerate(n["schedules"]):
                 when = s["when_text"] or "시점 언급 없음"
                 if s["date_type"] == "exact" and parse_date(s["date"]):
-                    when += f" ({fmt_date(parse_date(s['date']))})"
-                st.markdown(f"- **{s['title']}** · {when}" + ("" if s.get("verified", True) else " ⚠️근거 확인 필요"))
+                    when += f" ({fmt_date(parse_date(s['date']))}"
+                    when += f" {s['start']}" + (f"–{s['end']}" if s.get("end") else "") + ")" if s.get("start") else ")"
+                st.markdown(f"- **{s['title']}** · {when}" + (f" · {s['place']}" if s.get("place") else ""))
+                line = schedule_status_line(s)
+                {"calendar": st.success, "conflict": st.warning, "unverified": st.warning}.get(
+                    s.get("status"), st.caption)(line)
+                if s.get("status") == "conflict":
+                    st.caption("겹치는 일정: " + ", ".join(s.get("conflicts", [])))
+                    if st.button("겹치는 시간 확인하고 추가하기", key=f"sc_conf_{n['id']}_{j}"):
+                        r = add_event(s["title"], s["date"], f"회의에서 정한 일정 / 장소: {s.get('place') or '-'}",
+                                      "회의 분석", s.get("start", ""), s.get("end", ""), s.get("category", ""))
+                        s["status"] = "calendar" if r["status"] == "success" else "asked"
+                        if r["status"] == "success":
+                            s["event_id"] = r["id"]
+                        save_data()
+                        st.rerun()
+                if s.get("status") == "asked":
+                    st.caption("화면 위 '일정 충돌' 카드에서 시간을 골라 주세요.")
 
         st.markdown(f"#### 🙋 김 대리 업무 ({len(n['kim_tasks'])}건)")
         if not n["kim_tasks"]:
@@ -3409,7 +3484,7 @@ def analyze_mails(mails):
         "  끝에 '김 대리 드림'. false면 빈 문자열.",
     ])
     resp = get_client().responses.create(
-        model=MODEL, instructions=instructions, input=mail_payload(mails),
+        model=MODEL, temperature=0, instructions=instructions, input=mail_payload(mails),
         text={"format": {"type": "json_schema", "name": "mail_analysis", "schema": MAIL_SCHEMA, "strict": True}},
     )
     return json.loads(resp.output_text)["mails"]
@@ -3422,7 +3497,7 @@ def ensure_mail_summaries(mails):
     if missing:
         try:
             resp = get_client().responses.create(
-                model=MODEL,
+                model=MODEL, temperature=0,
                 instructions="각 메일을 본문에 있는 내용만으로 40자 이내 한 문장으로 요약합니다. "
                              "지어내지 않고, 광고·자동 알림이면 '광고/알림:'으로 시작합니다. index는 입력 번호 그대로.",
                 input=mail_payload(missing),
@@ -3442,7 +3517,7 @@ def ensure_mail_summaries(mails):
 
 def draft_mail(points, situation):
     resp = get_client().responses.create(
-        model=MODEL,
+        model=MODEL, temperature=0,
         instructions="\n".join([
             "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리 이름으로 보낼 업무 메일을 씁니다.",
             "- 김 대리가 준 요점에 있는 사실만 씁니다. 새로운 날짜·숫자·약속·이름을 만들지 않습니다.",
@@ -3931,6 +4006,26 @@ with st.sidebar:
         no_due = sum(1 for t in undone_all if not t["due"])
         if no_due:
             st.caption(f"기한 없는 할 일 {no_due}건은 📊 대시보드에서 확인하세요.")
+
+    # 1-1) 최근 회의에서 추가한 일정·할 일 (마감이 3일 뒤여도, 기한이 없어도 여기서 바로 보이게)
+    _note = latest_note()
+    if _note:
+        _ev_ids = {sc.get("event_id") for sc in _note["schedules"] if sc.get("event_id")}
+        _td_ids = {t.get("todo_id") for t in _note["kim_tasks"] if t.get("todo_id")}
+        _evs = sorted([e for e in data["events"] if e["id"] in _ev_ids], key=lambda e: (e["date"], e["start"] or ""))
+        _tds = sorted([t for t in data["todos"] if t["id"] in _td_ids and not t["done"]],
+                      key=lambda t: (t["due"] or "9999", PRIORITY_ORDER.get(t["priority"], 1)))
+        _conf = [sc for sc in _note["schedules"] if sc.get("status") in ("conflict", "asked")]
+        if _evs or _tds or _conf:
+            with st.expander(f"🆕 최근 회의에서 추가 (일정 {len(_evs)} · 할 일 {len(_tds)})",
+                             expanded=_note["when"][:10] == today.isoformat()):
+                st.caption(_note["title"])
+                for e in _evs:
+                    st.markdown(event_html(e), unsafe_allow_html=True)
+                for t in _tds:
+                    st.markdown(todo_html(t), unsafe_allow_html=True)
+                for sc in _conf:
+                    st.warning(f"'{sc['title']}'은 기존 일정과 겹쳐 아직 추가하지 않았어요. 🎙️ 회의 분석 탭에서 확인해 주세요.")
 
     # 2) 가장 최근 회의록 요약
     with st.expander("📝 최근 회의록 요약"):
