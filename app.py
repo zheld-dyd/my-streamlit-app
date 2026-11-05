@@ -3588,3 +3588,5 @@ with st.sidebar:
                                 f":gray[{m['from']} · {m['date']}]")
                     st.caption(sums[m["msg_id"]])
                 st.caption("🔵 = 읽지 않은 메일")
+
+
